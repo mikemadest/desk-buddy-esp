@@ -1,0 +1,687 @@
+esphome:
+  name: esphome-web-e4da60
+  friendly_name: Prototype-s3
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
+
+  on_boot:
+    priority: 15.0
+    then:
+      - text_sensor.template.publish:
+          id: current_emotion
+          state: "IDLE"
+      - lambda: 'id(last_interaction_ms) = millis();'
+      - script.execute: apply_mood_light
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+globals:
+  # Blocks motion reactions while a shake animation is running (not used for pets)
+  - id: motion_busy
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hud_active
+    type: bool
+    initial_value: 'false'
+  # 0 = neutral, 1 = smile, 2 = happy, 3 = heart eyes (caps at 3)
+  - id: happiness_level
+    type: int
+    initial_value: '0'
+  - id: last_interaction_ms
+    type: unsigned long
+    initial_value: '0'
+  - id: random_event_id
+    type: int
+    initial_value: '0'
+  - id: random_event_end_ms
+    type: unsigned long
+    initial_value: '0'
+  - id: mouth_talking
+    type: bool
+    initial_value: 'false'
+  - id: lonely_mode
+    type: bool
+    initial_value: 'false'
+
+logger:
+  logs:
+    mpu6050: ERROR
+    sensor: WARN
+
+api:
+  encryption:
+    key: !secret esphome_web_e4da60__encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    then:
+      - logger.log: "Wi-Fi connected, syncing Home Assistant time..."
+      - component.update: home_assistant_time
+
+# Shared I2C bus: SSD1306 OLED + MPU6050
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  scan: true
+  frequency: 100kHz
+
+time:
+  - platform: homeassistant
+    id: home_assistant_time
+    timezone: "Europe/Amsterdam"
+
+# Passive buzzer on GPIO6 — RTTTL plays melodies via LEDC PWM
+output:
+  - platform: ledc
+    pin: GPIO6
+    id: buzzer_pwm
+    min_power: 0.0
+    max_power: 0.10
+
+rtttl:
+  output: buzzer_pwm
+  id: robot_audio
+
+light:
+  - platform: esp32_rmt_led_strip
+    chipset: WS2812
+    rgb_order: RGB
+    pin: GPIO21
+    num_leds: 1
+    name: "Companion Status Light"
+    id: onboard_neopixel
+
+text_sensor:
+  - platform: template
+    id: current_emotion
+    name: "Buddy Current Emotion"
+    update_interval: never
+    lambda: |-
+      return {"IDLE"};
+
+sensor:
+  - platform: template
+    name: "Buddy Happiness Level"
+    id: happiness_sensor
+    icon: "mdi:heart"
+    unit_of_measurement: "lvl"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(happiness_level);
+    update_interval: 1s
+
+  - platform: homeassistant
+    id: current_temperature
+    entity_id: sensor.presence_sensor_entrance_device_temperature
+
+  - platform: homeassistant
+    id: room_humidity
+    entity_id: sensor.ikea_vindstyrka_air_monitor_1_humidity
+
+  - platform: mpu6050
+    address: 0x68
+    update_interval: 100ms
+
+    accel_x:
+      name: "X-Axis Acceleration"
+      filters:
+        - delta: 2.0
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(motion_busy) && !id(hud_active);'
+              then:
+                - rtttl.stop:
+                    id: robot_audio
+                - script.execute:
+                    id: handle_motion
+                    intensity: !lambda 'return abs(x);'
+
+    accel_y:
+      name: "Y-Axis Acceleration"
+      filters:
+        - delta: 2.0
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(motion_busy) && !id(hud_active);'
+              then:
+                - rtttl.stop:
+                    id: robot_audio
+                - script.execute:
+                    id: handle_motion
+                    intensity: !lambda 'return abs(x);'
+
+    accel_z:
+      name: "Z-Axis Acceleration"
+      filters:
+        - delta: 2.0
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(motion_busy) && !id(hud_active);'
+              then:
+                - rtttl.stop:
+                    id: robot_audio
+                - script.execute:
+                    id: handle_motion
+                    intensity: !lambda 'return abs(x);'
+
+switch:
+  - platform: gpio
+    pin: GPIO7
+    id: vib_motor
+    name: "Vibration Actuator"
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLDOWN
+    name: "Head Touch Sensor"
+    on_click:
+      # Short tap — pet the buddy (can repeat quickly; scripts use mode: restart)
+      - min_length: 50ms
+        max_length: 499ms
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(motion_busy) && !id(hud_active);'
+              then:
+                - script.execute: handle_head_pet
+
+      # Medium hold — toggle the status HUD overlay
+      - min_length: 500ms
+        max_length: 1000ms
+        then:
+          - if:
+              condition:
+                lambda: 'return !id(motion_busy);'
+              then:
+                - lambda: 'id(hud_active) = !id(hud_active);'
+                - rtttl.play: "hud_toggle:d=32,o=6,b=200:g,c"
+                - lambda: 'id(last_interaction_ms) = millis();'
+
+interval:
+  # Periodic life tick — random idle animations and lonely mode checks
+  - interval: 35s
+    then:
+      - script.execute: life_tick
+
+# Scripts replace long delay chains. A delay only pauses *this* script — Wi-Fi, display,
+# sensors, and other scripts keep running. mode: restart lets new pets cancel old timers.
+script:
+  - id: apply_mood_light
+    then:
+      - lambda: |-
+          auto call = id(onboard_neopixel).turn_on();
+          switch (id(happiness_level)) {
+            case 3:
+              call.set_brightness(0.55);
+              call.set_rgb(1.0, 0.15, 0.55);
+              break;
+            case 2:
+              call.set_brightness(0.45);
+              call.set_rgb(0.80, 0.28, 0.50);
+              break;
+            case 1:
+              call.set_brightness(0.38);
+              call.set_rgb(0.55, 0.42, 0.38);
+              break;
+            default:
+              call.set_brightness(0.3);
+              call.set_rgb(0.0, 0.5, 1.0);
+              break;
+          }
+          call.perform();
+
+  - id: handle_head_pet
+    mode: restart
+    then:
+      - lambda: |-
+          id(last_interaction_ms) = millis();
+          id(lonely_mode) = false;
+          if (id(happiness_level) < 3) {
+            id(happiness_level)++;
+          }
+          switch (id(happiness_level)) {
+            case 1:
+              id(current_emotion).publish_state("SMILE :)");
+              id(robot_audio).play("tap1:d=32,o=6,b=200:c,e");
+              break;
+            case 2:
+              id(current_emotion).publish_state("HAPPY :D");
+              id(robot_audio).play("tap2:d=32,o=6,b=240:c,e,g");
+              break;
+            default:
+              id(current_emotion).publish_state("HEART EYES <3");
+              id(robot_audio).play("tap3:d=32,o=6,b=280:c,e,g,c7,e7");
+              break;
+          }
+      - script.execute: mouth_talk_pet
+      - light.turn_on:
+          id: onboard_neopixel
+          brightness: 85%
+          red: 1.0
+          green: 0.25
+          blue: 0.55
+      - switch.turn_on: vib_motor
+      - delay: 100ms
+      - switch.turn_off: vib_motor
+      - script.execute: clear_pet_emotion
+      - script.execute: happiness_decay
+
+  - id: clear_pet_emotion
+    mode: restart
+    then:
+      - delay: 2.5s
+      - text_sensor.template.publish:
+          id: current_emotion
+          state: "IDLE"
+      - script.execute: apply_mood_light
+
+  - id: happiness_decay
+    mode: restart
+    then:
+      - delay: 5s
+      - while:
+          condition:
+            lambda: 'return id(happiness_level) > 0;'
+          then:
+            - lambda: 'id(happiness_level)--;'
+            - script.execute: apply_mood_light
+            - delay: 3s
+
+  - id: handle_motion
+    mode: single
+    parameters:
+      intensity: float
+    then:
+      - lambda: |-
+          id(motion_busy) = true;
+          id(last_interaction_ms) = millis();
+          id(lonely_mode) = false;
+          if (intensity > 6.0) {
+            id(current_emotion).publish_state("DIZZY @.@");
+            id(robot_audio).play("dizzy:d=16,o=5,b=200:g,f,e,d,c");
+          } else {
+            id(current_emotion).publish_state("SURPRISED O.O");
+            id(robot_audio).play("surprise:d=16,o=6,b=240:g,g");
+          }
+      - script.execute: mouth_talk_motion
+      - light.turn_on:
+          id: onboard_neopixel
+          brightness: 80%
+          red: 0.5
+          green: 0.5
+          blue: 0.0
+      - switch.turn_on: vib_motor
+      - delay: 150ms
+      - switch.turn_off: vib_motor
+      - delay: 2.5s
+      - text_sensor.template.publish:
+          id: current_emotion
+          state: "IDLE"
+      - lambda: 'id(motion_busy) = false;'
+      - script.execute: apply_mood_light
+
+  - id: mouth_talk_pet
+    mode: restart
+    then:
+      - lambda: 'id(mouth_talking) = true;'
+      - delay: 900ms
+      - lambda: 'id(mouth_talking) = false;'
+
+  - id: mouth_talk_motion
+    mode: restart
+    then:
+      - lambda: 'id(mouth_talking) = true;'
+      - delay: 1200ms
+      - lambda: 'id(mouth_talking) = false;'
+
+  - id: random_chirp
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(current_emotion).state == "IDLE" && !id(motion_busy);'
+          then:
+            - lambda: |-
+                id(mouth_talking) = true;
+                id(robot_audio).play("idle:d=32,o=7,b=320:e,c");
+            - delay: 350ms
+            - lambda: 'id(mouth_talking) = false;'
+
+  - id: life_tick
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(current_emotion).state == "IDLE" && !id(motion_busy)
+                && !id(hud_active) && id(random_event_id) == 0;
+          then:
+            - lambda: |-
+                uint32_t idle_ms = millis() - id(last_interaction_ms);
+                int chance = 14;
+                if (idle_ms > 1800000UL) {
+                  id(lonely_mode) = true;
+                  chance = 40;
+                } else if (idle_ms > 600000UL) {
+                  chance = 22;
+                } else {
+                  id(lonely_mode) = false;
+                }
+                if ((random() % 100) >= chance) return;
+                int evt = (random() % 8);
+                if (id(lonely_mode) && (random() % 100) < 55) evt = 7;
+                id(random_event_id) = evt;
+                id(random_event_end_ms) = millis() + 1600 + (random() % 900);
+            - if:
+                condition:
+                  lambda: 'return id(random_event_id) == 5 || id(random_event_id) == 7;'
+                then:
+                  - script.execute: random_chirp
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 250ms
+    lambda: |-
+      if (id(hud_active)) {
+        it.print(64, 0, id(font_small), TextAlign::TOP_CENTER, "--- STATUS HUD ---");
+        it.strftime(0, 18, id(font_small), "Time: %H:%M", id(home_assistant_time).now());
+        it.printf(0, 34, id(font_small), "Mood: %d/3", id(happiness_level));
+        if (id(current_temperature).has_state() && id(room_humidity).has_state()) {
+          it.printf(0, 50, id(font_small), "%.0fC  %.0f%%", id(current_temperature).state, id(room_humidity).state);
+        } else if (id(current_temperature).has_state()) {
+          it.printf(0, 50, id(font_small), "Temp: %.0f C", id(current_temperature).state);
+        }
+        return;
+      }
+
+      const int EL = 44;
+      const int ER = 84;
+      const int EY = 22;
+      const int MX = 64;
+      const int MY = 50;
+
+      uint32_t ms = millis();
+      int anim = (ms / 400) % 2;
+      bool blink = ((ms / 4500) % 2 == 0) && ((ms % 4500) < 220);
+
+      auto eye_open = [&](int cx, int cy, int r) {
+        it.filled_circle(cx, cy, r, Color(1));
+      };
+      auto eye_closed = [&](int cx, int cy, int w) {
+        it.line(cx - w, cy, cx + w, cy, Color(1));
+      };
+      auto eye_happy = [&](int cx, int cy, int s) {
+        it.line(cx - s, cy + 2, cx, cy - s, Color(1));
+        it.line(cx, cy - s, cx + s, cy + 2, Color(1));
+      };
+      auto eye_surprised = [&](int cx, int cy, int r) {
+        it.circle(cx, cy, r, Color(1));
+        it.filled_circle(cx, cy, 3, Color(1));
+      };
+      auto eye_dizzy = [&](int cx, int cy, int s) {
+        it.line(cx - s, cy - s, cx + s, cy + s, Color(1));
+        it.line(cx - s, cy + s, cx + s, cy - s, Color(1));
+      };
+      auto eye_heart = [&](int cx, int cy) {
+        it.filled_circle(cx - 3, cy - 2, 3, Color(1));
+        it.filled_circle(cx + 3, cy - 2, 3, Color(1));
+        it.line(cx - 6, cy, cx, cy + 6, Color(1));
+        it.line(cx + 6, cy, cx, cy + 6, Color(1));
+        it.line(cx, cy + 6, cx - 6, cy, Color(1));
+      };
+      auto eye_sleepy = [&](int cx, int cy, int r) {
+        it.filled_circle(cx, cy, r, Color(1));
+        it.line(cx - r - 1, cy - 1, cx + r + 1, cy - 1, Color(1));
+      };
+      auto eye_working = [&](int cx, int cy) {
+        it.filled_circle(cx, cy, 6, Color(1));
+        it.filled_rectangle(cx - 1, cy - 6, cx + 1, cy + 6, Color(0));
+      };
+      auto mouth_smile = [&](int cy, int w) {
+        it.line(MX - w, cy - 2, MX - w / 2, cy + 3, Color(1));
+        it.line(MX - w / 2, cy + 3, MX + w / 2, cy + 3, Color(1));
+        it.line(MX + w / 2, cy + 3, MX + w, cy - 2, Color(1));
+      };
+      auto mouth_big_smile = [&](int cy, int w) {
+        it.line(MX - w, cy, MX - w / 2, cy + 5, Color(1));
+        it.line(MX - w / 2, cy + 5, MX + w / 2, cy + 5, Color(1));
+        it.line(MX + w / 2, cy + 5, MX + w, cy, Color(1));
+        it.line(MX - w / 2, cy + 5, MX, cy + 7, Color(1));
+        it.line(MX, cy + 7, MX + w / 2, cy + 5, Color(1));
+      };
+      auto mouth_o = [&](int cy, int r) {
+        it.circle(MX, cy, r, Color(1));
+      };
+      auto mouth_line = [&](int cy, int w) {
+        it.line(MX - w, cy, MX + w, cy, Color(1));
+      };
+      auto mouth_dizzy = [&](int cy) {
+        it.line(MX - 10, cy, MX - 3, cy + 3, Color(1));
+        it.line(MX - 3, cy + 3, MX + 3, cy - 3, Color(1));
+        it.line(MX + 3, cy - 3, MX + 10, cy, Color(1));
+      };
+      auto brow_flat = [&](int cx, int cy) {
+        it.line(cx - 7, cy, cx + 7, cy, Color(1));
+      };
+      auto brow_raise = [&](int cx, int cy, int tilt) {
+        it.line(cx - 7, cy + tilt, cx + 7, cy - tilt, Color(1));
+      };
+      auto brow_furrow = [&](int cx, int cy) {
+        it.line(cx - 7, cy - 1, cx + 7, cy + 2, Color(1));
+      };
+      auto draw_glasses = [&](int cy) {
+        it.rectangle(EL - 11, cy - 9, EL + 11, cy + 9, Color(1));
+        it.rectangle(ER - 11, cy - 9, ER + 11, cy + 9, Color(1));
+        it.line(EL + 11, cy - 4, ER - 11, cy - 4, Color(1));
+        it.line(EL - 11, cy - 1, EL - 18, cy - 3, Color(1));
+        it.line(ER + 11, cy - 1, ER + 18, cy - 3, Color(1));
+      };
+      auto mouth_talk = [&](int cy, int open_r) {
+        if ((ms / 130) % 2) {
+          mouth_o(cy, open_r);
+        } else {
+          mouth_line(cy, open_r);
+        }
+      };
+      auto mouth_smile_or_talk = [&](int cy, int w) {
+        if (id(mouth_talking)) mouth_talk(cy, 4);
+        else mouth_smile(cy, w);
+      };
+      auto mouth_big_or_talk = [&](int cy, int w) {
+        if (id(mouth_talking)) mouth_talk(cy, 5);
+        else mouth_big_smile(cy, w);
+      };
+      auto mouth_o_or_talk = [&](int cy, int r) {
+        if (id(mouth_talking)) mouth_talk(cy, r - 1);
+        else mouth_o(cy, r);
+      };
+
+      if (id(random_event_id) != 0 && millis() >= id(random_event_end_ms)) {
+        id(random_event_id) = 0;
+      }
+
+      int face = 0;
+      const std::string &emo = id(current_emotion).state;
+
+      if (emo == "SMILE :)") {
+        face = 10;
+      } else if (emo == "HAPPY :D") {
+        face = 11;
+      } else if (emo == "HEART EYES <3") {
+        face = 12;
+      } else if (emo == "SURPRISED O.O") {
+        face = 13;
+      } else if (emo == "DIZZY @.@") {
+        face = 14;
+      } else if (id(random_event_id) > 0 && millis() < id(random_event_end_ms)) {
+        face = 29 + id(random_event_id);
+      } else if (id(happiness_level) >= 3) {
+        face = anim ? 22 : 21;
+      } else if (id(happiness_level) == 2) {
+        face = anim ? 17 : 16;
+      } else if (id(happiness_level) == 1) {
+        face = 15;
+      } else {
+        int hour = id(home_assistant_time).now().hour;
+        if (hour >= 7 && hour < 9) {
+          face = 1;
+        } else if (hour >= 9 && hour < 12) {
+          face = 2;
+        } else if (hour >= 12 && hour < 13) {
+          face = 3;
+        } else if (hour >= 13 && hour < 18) {
+          face = anim ? 5 : 4;
+        } else if (hour >= 18 && hour < 22) {
+          face = 6;
+        } else if (hour >= 22 || hour < 7) {
+          face = 7;
+        } else {
+          face = 0;
+        }
+      }
+
+      int y_off = 0;
+      if (face == 5) {
+        y_off = anim ? -3 : 3;
+      }
+
+      switch (face) {
+        case 14:
+          eye_dizzy(EL, EY + y_off, 7);
+          eye_dizzy(ER, EY + y_off, 7);
+          mouth_dizzy(MY);
+          break;
+        case 13:
+          eye_surprised(EL, EY + y_off, 10);
+          eye_surprised(ER, EY + y_off, 10);
+          mouth_o(MY, 6);
+          break;
+        case 12:
+          eye_heart(EL, EY + y_off - 1);
+          eye_heart(ER, EY + y_off - 1);
+          mouth_big_smile(MY, 14);
+          break;
+        case 11:
+          eye_happy(EL, EY + y_off, 7);
+          eye_happy(ER, EY + y_off, 7);
+          mouth_big_smile(MY, 14);
+          break;
+        case 10:
+          if (blink) {
+            eye_closed(EL, EY + y_off, 7);
+            eye_closed(ER, EY + y_off, 7);
+          } else {
+            eye_open(EL, EY + y_off, 7);
+            eye_open(ER, EY + y_off, 7);
+          }
+          mouth_smile(MY, 10);
+          break;
+        case 22:
+          eye_happy(EL, EY + y_off, 8);
+          eye_happy(ER, EY + y_off, 8);
+          mouth_smile(MY, 11);
+          break;
+        case 21:
+          eye_heart(EL, EY + y_off - 1);
+          eye_heart(ER, EY + y_off - 1);
+          mouth_big_smile(MY, 15);
+          break;
+        case 17:
+          eye_happy(EL, EY + y_off, 7);
+          eye_happy(ER, EY + y_off, 7);
+          mouth_smile(MY, 12);
+          break;
+        case 16:
+          if (blink) {
+            eye_closed(EL, EY + y_off, 8);
+            eye_closed(ER, EY + y_off, 8);
+          } else {
+            eye_open(EL, EY + y_off, 8);
+            eye_open(ER, EY + y_off, 8);
+          }
+          mouth_big_smile(MY, 13);
+          break;
+        case 15:
+          if (blink) {
+            eye_closed(EL, EY + y_off, 7);
+            eye_closed(ER, EY + y_off, 7);
+          } else {
+            eye_open(EL, EY + y_off, 7);
+            eye_open(ER, EY + y_off, 7);
+          }
+          mouth_smile(MY, 9);
+          break;
+        case 7:
+          eye_closed(EL, EY, 8);
+          eye_closed(ER, EY, 8);
+          mouth_line(MY + 2, 4);
+          break;
+        case 6:
+          if (blink) {
+            eye_closed(EL, EY, 7);
+            eye_closed(ER, EY, 7);
+          } else {
+            eye_open(EL, EY, 7);
+            eye_open(ER, EY, 7);
+          }
+          mouth_smile(MY, 8);
+          break;
+        case 5:
+          eye_open(EL - 4, EY + y_off, 7);
+          eye_open(ER - 4, EY + y_off, 7);
+          mouth_smile(MY, 9);
+          break;
+        case 4:
+          eye_open(EL + 4, EY + y_off, 7);
+          eye_open(ER + 4, EY + y_off, 7);
+          mouth_line(MY, 5);
+          break;
+        case 3:
+          eye_open(EL, EY, 8);
+          eye_open(ER, EY, 8);
+          mouth_o(MY, 5);
+          break;
+        case 2:
+          eye_working(EL, EY);
+          eye_working(ER, EY);
+          mouth_line(MY, 6);
+          break;
+        case 1:
+          eye_sleepy(EL, EY, 7);
+          eye_sleepy(ER, EY, 7);
+          mouth_o(MY, 4);
+          break;
+        default:
+          if (blink) {
+            eye_closed(EL, EY, 7);
+            eye_closed(ER, EY, 7);
+          } else {
+            eye_open(EL, EY, 7);
+            eye_open(ER, EY, 7);
+          }
+          mouth_line(MY, 5);
+          break;
+      }
