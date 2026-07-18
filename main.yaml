@@ -18,35 +18,6 @@ esp32:
   framework:
     type: esp-idf
 
-globals:
-  # Blocks motion reactions while a shake animation is running (not used for pets)
-  - id: motion_busy
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: hud_active
-    type: bool
-    initial_value: 'false'
-  # 0 = neutral, 1 = smile, 2 = happy, 3 = heart eyes (caps at 3)
-  - id: happiness_level
-    type: int
-    initial_value: '0'
-  - id: last_interaction_ms
-    type: unsigned long
-    initial_value: '0'
-  - id: random_event_id
-    type: int
-    initial_value: '0'
-  - id: random_event_end_ms
-    type: unsigned long
-    initial_value: '0'
-  - id: mouth_talking
-    type: bool
-    initial_value: 'false'
-  - id: lonely_mode
-    type: bool
-    initial_value: 'false'
-
 logger:
   logs:
     mpu6050: ERROR
@@ -71,13 +42,18 @@ wifi:
 i2c:
   sda: GPIO4
   scl: GPIO5
-  scan: true
+  scan: false
   frequency: 100kHz
 
 time:
   - platform: homeassistant
     id: home_assistant_time
     timezone: "Europe/Amsterdam"
+    on_time_sync:
+      then:
+        - lambda: |-
+            // Reset idle timer on clock sync to prevent immediate "Lonely" state on reboot/sync
+            id(last_interaction_ms) = millis();
 
 # Passive buzzer on GPIO6 — RTTTL plays melodies via LEDC PWM
 output:
@@ -106,7 +82,19 @@ text_sensor:
     name: "Buddy Current Emotion"
     update_interval: never
     lambda: |-
-      return {"IDLE"};
+      switch (id(current_state)) {
+        case id(STATE_IDLE):            return {"IDLE"};
+        case id(STATE_SMILE_ACTIVE):    return {"SMILE :)"};
+        case id(STATE_SURPRISED):       return {"SURPRISED O.O"};
+        case id(STATE_DIZZY):           return {"DIZZY @.@"};
+        // Happiness-based faces (stable/animated variants)
+        case id(STATE_SMILE):           return {"SMILE :)"};
+        case id(STATE_HAPPY):
+        case id(STATE_HAPPY_ANIM):      return {"HAPPY :D"};
+        case id(STATE_HEART_EYES):
+        case id(STATE_HEART_EYES_ANIM): return {"HEART EYES <3"};
+        default:                       return {id(current_emotion).state.c_str()}; // Fallback to previous string or "UNKNOWN"
+      }
 
 sensor:
   - platform: template
@@ -135,49 +123,43 @@ sensor:
       name: "X-Axis Acceleration"
       filters:
         - delta: 2.0
-      on_value:
-        then:
-          - if:
-              condition:
-                lambda: 'return !id(motion_busy) && !id(hud_active);'
-              then:
-                - rtttl.stop:
-                    id: robot_audio
-                - script.execute:
-                    id: handle_motion
-                    intensity: !lambda 'return abs(x);'
+      on_value_range:
+        # Detect Shake (Positive spike)
+        - above: 2.5
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(motion_busy) && !id(hud_active);'
+                then:
+                  - script.execute: handle_shake
 
     accel_y:
       name: "Y-Axis Acceleration"
       filters:
         - delta: 2.0
-      on_value:
-        then:
-          - if:
-              condition:
-                lambda: 'return !id(motion_busy) && !id(hud_active);'
-              then:
-                - rtttl.stop:
-                    id: robot_audio
-                - script.execute:
-                    id: handle_motion
-                    intensity: !lambda 'return abs(x);'
+      on_value_range:
+        # Detect Shake (Negative spike)
+        - below: -2.5
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(motion_busy) && !id(hud_active);'
+                then:
+                  - script.execute: handle_shake
 
     accel_z:
       name: "Z-Axis Acceleration"
       filters:
         - delta: 2.0
-      on_value:
-        then:
-          - if:
-              condition:
-                lambda: 'return !id(motion_busy) && !id(hud_active);'
-              then:
-                - rtttl.stop:
-                    id: robot_audio
-                - script.execute:
-                    id: handle_motion
-                    intensity: !lambda 'return abs(x);'
+      on_value_range:
+        # Detect Shake (Positive spike)
+        - above: 2.5
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(motion_busy) && !id(hud_active);'
+                then:
+                  - script.execute: handle_shake
 
 switch:
   - platform: gpio
@@ -204,7 +186,7 @@ binary_sensor:
 
       # Medium hold — toggle the status HUD overlay
       - min_length: 500ms
-        max_length: 1000ms
+        max_length: 5000ms
         then:
           - if:
               condition:
@@ -220,9 +202,154 @@ interval:
     then:
       - script.execute: life_tick
 
-# Scripts replace long delay chains. A delay only pauses *this* script — Wi-Fi, display,
-# sensors, and other scripts keep running. mode: restart lets new pets cancel old timers.
+# ===========================================================================
+# DISPLAY HELPERS (code block for readability)
+# ===========================================================================
+# Face state constants (also used as display enum indices)
+# Active states (triggered by interaction):
+#   STATE_SMILE_ACTIVE=10, STATE_SURPRISED=13, STATE_DIZZY=14
+# Happiness-based faces (decay over time):
+#   STATE_SMILE=15 (happiness_level=1), STATE_HAPPY=16, STATE_HAPPY_ANIM=17, STATE_HEART_EYES=21, STATE_HEART_EYES_ANIM=22
+# Idle/time-of-day faces (no interaction yet):
+#   STATE_WORKING=2 (morning), STATE_FOCUS=5 (zoning in), STATE_BORED=4 (zoning out)
+#   STATE_SAD=6 (evening), STATE_SLEEP=7 (night)
+# Event idle animation faces (display offset 29, randomized by life_tick):
+#   +0=STATE_SLEEPY_MAPLE, +1=STATE_DIZZY_MAPLE, +2=STATE_HEART_MAPLE,
+#     +3=STATE_YAWNING_MAPLE, +4=STATE_WORKING_MAPLE, +5=STATE_SAD_MAPLE,
+#     +6=STATE_BORED_MAPLE, +7=STATE_THUMBUP_MAPPLE (lonely mode favored)
+globals:
+  # --- State Machine Constants ---
+  - id: STATE_IDLE
+    type: int
+    initial_value: '0'
+  - id: STATE_SMILE_ACTIVE
+    type: int
+    initial_value: '10'
+  - id: STATE_SURPRISED
+    type: int
+    initial_value: '13'
+  - id: STATE_DIZZY
+    type: int
+    initial_value: '14'
+  - id: STATE_SMILE
+    type: int
+    initial_value: '15'
+  - id: STATE_HAPPY
+    type: int
+    initial_value: '16'
+  - id: STATE_HAPPY_ANIM
+    type: int
+    initial_value: '17'
+  - id: STATE_HEART_EYES
+    type: int
+    initial_value: '21'
+  - id: STATE_HEART_EYES_ANIM
+    type: int
+    initial_value: '22'
+  - id: STATE_WORKING
+    type: int
+    initial_value: '2'
+  - id: STATE_FOCUS
+    type: int
+    initial_value: '5'
+  - id: STATE_BORED
+    type: int
+    initial_value: '4'
+  - id: STATE_SAD
+    type: int
+    initial_value: '6'
+  - id: STATE_SLEEP
+    type: int
+    initial_value: '7'
+  - id: STATE_SLEEPY_MAPLE
+    type: int
+    initial_value: '29'
+  - id: STATE_DIZZY_MAPLE
+    type: int
+    initial_value: '30'
+  - id: STATE_HEART_MAPLE
+    type: int
+    initial_value: '31'
+  - id: STATE_YAWNING_MAPLE
+    type: int
+    initial_value: '32'
+  - id: STATE_WORKING_MAPLE
+    type: int
+    initial_value: '33'
+  - id: STATE_SAD_MAPLE
+    type: int
+    initial_value: '34'
+  - id: STATE_BORED_MAPLE
+    type: int
+    initial_value: '35'
+  - id: STATE_THUMBUP_MAPPLE
+    type: int
+    initial_value: '36'
+  - id: STATE_EVENT_BASE
+    type: int
+    initial_value: '29'
+  - id: STATE_NONE
+    type: int
+    initial_value: '-1'
+
+  # --- State Management Variables ---
+  - id: current_state
+    type: int
+    initial_value: '0'  # STATE_IDLE
+
+  # Blocks motion reactions while a shake animation is running (not used for pets)
+  - id: motion_busy
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: hud_active
+    type: bool
+    initial_value: 'false'
+  # 0 = neutral, 1 = smile, 2 = happy, 3 = heart eyes (caps at 3)
+  - id: happiness_level
+    type: int
+    initial_value: '0'
+  - id: last_interaction_ms
+    type: unsigned long
+    initial_value: '0'
+  - id: random_event_id
+    type: int
+    initial_value: '-1'  # STATE_NONE sentinel — no active event
+  - id: random_event_end_ms
+    type: unsigned long
+    initial_value: '0'
+  - id: mouth_talking
+    type: bool
+    initial_value: 'false'
+  - id: lonely_mode
+    type: bool
+    initial_value: 'false'
+
+# --- State Management Functions ---
+  - id: set_state
+    parameters:
+      state: int
+    then:
+      - lambda: |-
+          id(current_state) = state;
+
+# --- Main Scripts ---
 script:
+  - id: handle_shake
+    mode: single
+    then:
+      - lambda: |-
+          uint32_t idle_ms = millis() - id(last_interaction_ms);
+          if (idle_ms < 1000) return; // Cooldown
+          id(last_interaction_ms) = millis();
+      
+      # We pass a high intensity (e.g., 7.0) to trigger the "Dizzy" state,
+      # as shake events are typically vigorous. If you want "Surprised" for taps,
+      # change this to 5.0.
+      - script.execute:
+          id: handle_motion
+          intensity: 7.0 
+
   - id: apply_mood_light
     then:
       - lambda: |-
@@ -251,6 +378,7 @@ script:
     mode: restart
     then:
       - lambda: |-
+          id(current_state) = id(STATE_IDLE);
           id(last_interaction_ms) = millis();
           id(lonely_mode) = false;
           if (id(happiness_level) < 3) {
@@ -258,15 +386,15 @@ script:
           }
           switch (id(happiness_level)) {
             case 1:
-              id(current_emotion).publish_state("SMILE :)");
+               id(current_state) = id(STATE_SMILE); // happiness=1 → smile face
               id(robot_audio).play("tap1:d=32,o=6,b=200:c,e");
               break;
             case 2:
-              id(current_emotion).publish_state("HAPPY :D");
+               id(current_state) = id(STATE_HAPPY); // happiness=2 → happy face
               id(robot_audio).play("tap2:d=32,o=6,b=240:c,e,g");
               break;
             default:
-              id(current_emotion).publish_state("HEART EYES <3");
+              id(current_state) = id(STATE_HEART_EYES); // happiness=3 → heart eyes
               id(robot_audio).play("tap3:d=32,o=6,b=280:c,e,g,c7,e7");
               break;
           }
@@ -287,14 +415,13 @@ script:
     mode: restart
     then:
       - delay: 2.5s
-      - text_sensor.template.publish:
-          id: current_emotion
-          state: "IDLE"
+      - lambda: 'id(current_state) = id(STATE_IDLE);' # Reset to neutral/idle
       - script.execute: apply_mood_light
 
   - id: happiness_decay
     mode: restart
     then:
+      - lambda: 'id(last_interaction_ms) = millis();'
       - delay: 5s
       - while:
           condition:
@@ -310,15 +437,20 @@ script:
       intensity: float
     then:
       - lambda: |-
+          id(current_state) = id(STATE_IDLE);
           id(motion_busy) = true;
           id(last_interaction_ms) = millis();
           id(lonely_mode) = false;
+
           if (intensity > 6.0) {
-            id(current_emotion).publish_state("DIZZY @.@");
+            id(current_state) = id(STATE_DIZZY); // Dizzy: vigorous shake
             id(robot_audio).play("dizzy:d=16,o=5,b=200:g,f,e,d,c");
-          } else {
-            id(current_emotion).publish_state("SURPRISED O.O");
+          } else if (intensity >= 3.0) {
+            id(current_state) = id(STATE_SURPRISED); // Surprised: moderate shake
             id(robot_audio).play("surprise:d=16,o=6,b=240:g,g");
+          } else {
+            id(current_state) = id(STATE_WORKING); // Curious glance: light tap
+            id(robot_audio).play("peek:d=16,o=6,b=300:e,e");
           }
       - script.execute: mouth_talk_motion
       - light.turn_on:
@@ -331,9 +463,7 @@ script:
       - delay: 150ms
       - switch.turn_off: vib_motor
       - delay: 2.5s
-      - text_sensor.template.publish:
-          id: current_emotion
-          state: "IDLE"
+      - lambda: 'id(current_state) = id(STATE_IDLE);' # Reset face state to idle after animation
       - lambda: 'id(motion_busy) = false;'
       - script.execute: apply_mood_light
 
@@ -356,7 +486,7 @@ script:
     then:
       - if:
           condition:
-            lambda: 'return id(current_emotion).state == "IDLE" && !id(motion_busy);'
+            lambda: 'return id(current_state) == id(STATE_IDLE) && !id(motion_busy);'
           then:
             - lambda: |-
                 id(mouth_talking) = true;
@@ -369,25 +499,33 @@ script:
       - if:
           condition:
             lambda: |-
-              return id(current_emotion).state == "IDLE" && !id(motion_busy)
-                && !id(hud_active) && id(random_event_id) == 0;
+              return id(current_state) == id(STATE_IDLE) && !id(motion_busy)
+                && !id(hud_active) && id(random_event_id) == id(STATE_NONE);
           then:
             - lambda: |-
                 uint32_t idle_ms = millis() - id(last_interaction_ms);
-                int chance = 14;
-                if (idle_ms > 1800000UL) {
-                  id(lonely_mode) = true;
-                  chance = 40;
-                } else if (idle_ms > 600000UL) {
-                  chance = 22;
-                } else {
-                  id(lonely_mode) = false;
+
+                // Pick a trigger chance from the table (first entry where threshold <= idle)
+                struct { int64_t ms; uint8_t chance; } TABLE[] = {
+                  { 0,      0 },   // fresh — no event
+                  { 60000,  5 },  // < 1 min: rare (5%)
+                  { 300000, 14 }, // 1-5 min: occasional chirp (14%)
+                  { 900000, 28 }, // 5-15 min: moderate interest (28%)
+                  { 1800000,45 }, // 30+ min: lonely mode (45%)
+                };
+                int pick = -1;
+                for (int i = 0; i < 5; i++) {
+                  if (idle_ms >= TABLE[i].ms) pick = i;
                 }
-                if ((random() % 100) >= chance) return;
-                int evt = (random() % 8);
-                if (id(lonely_mode) && (random() % 100) < 55) evt = 7;
+                if (pick < 0 || (random() % 100) >= TABLE[pick].chance) return;
+
+                // Pick event index: early idle favors calm events, later unlocks all
+                int evt_max = (pick >= 3) ? 8 : 6; // calm events only before 15 min
+                int evt = random() % evt_max;
+                if (id(lonely_mode) && (random() % 100) < 60) evt = 7; // thumbs-up in lonely mode
+
                 id(random_event_id) = evt;
-                id(random_event_end_ms) = millis() + 1600 + (random() % 900);
+                id(random_event_end_ms) = millis() + 2000 + (random() % 800);
             - if:
                 condition:
                   lambda: 'return id(random_event_id) == 5 || id(random_event_id) == 7;'
@@ -405,6 +543,85 @@ display:
     address: 0x3C
     update_interval: 250ms
     lambda: |-
+      const int EL = 44;
+      const int ER = 84;
+      const int EY = 22;
+      const int MX = 64;
+      const int MY = 50;
+
+      // Helper functions defined locally for this lambda
+      auto draw_eye_open = [&](int cx, int cy, int r) {
+        it.filled_circle(cx, cy, r, Color(1));
+      };
+
+      auto draw_eye_closed = [&](int cx, int cy, int w) {
+        it.line(cx - w, cy, cx + w, cy, Color(1));
+      };
+
+      auto draw_eye_happy = [&](int cx, int cy, int s) {
+        it.line(cx - s, cy + 2, cx, cy - s, Color(1));
+        it.line(cx, cy - s, cx + s, cy + 2, Color(1));
+      };
+
+      auto draw_eye_surprised = [&](int cx, int cy, int r) {
+        it.circle(cx, cy, r, Color(1));
+        it.filled_circle(cx, cy, 3, Color(1));
+      };
+
+      auto draw_eye_dizzy = [&](int cx, int cy, int s) {
+        it.line(cx - s, cy - s, cx + s, cy + s, Color(1));
+        it.line(cx - s, cy + s, cx + s, cy - s, Color(1));
+      };
+
+      auto draw_eye_heart = [&](int cx, int cy) {
+        it.filled_circle(cx - 3, cy - 2, 3, Color(1));
+        it.filled_circle(cx + 3, cy - 2, 3, Color(1));
+        it.line(cx - 6, cy, cx, cy + 6, Color(1));
+        it.line(cx + 6, cy, cx, cy + 6, Color(1));
+        it.line(cx, cy + 6, cx - 6, cy, Color(1));
+      };
+
+      auto draw_eye_sleepy = [&](int cx, int cy, int r) {
+        it.filled_circle(cx, cy, r, Color(1));
+        it.line(cx - r - 1, cy - 1, cx + r + 1, cy - 1, Color(1));
+      };
+
+      auto draw_eye_working = [&](int cx, int cy) {
+        it.filled_circle(cx, cy, 6, Color(1));
+        it.filled_rectangle(cx - 1, cy - 6, cx + 1, cy + 6, Color(0));
+      };
+
+      auto draw_mouth_smile = [&](int cy, int w) {
+        it.line(MX - w, cy - 2, MX - w / 2, cy + 3, Color(1));
+        it.line(MX - w / 2, cy + 3, MX + w / 2, cy + 3, Color(1));
+        it.line(MX + w / 2, cy + 3, MX + w, cy - 2, Color(1));
+      };
+
+      auto draw_mouth_big_smile = [&](int cy, int w) {
+        it.line(MX - w, cy, MX - w / 2, cy + 5, Color(1));
+        it.line(MX - w / 2, cy + 5, MX + w / 2, cy + 5, Color(1));
+        it.line(MX + w / 2, cy + 5, MX + w, cy, Color(1));
+        it.line(MX - w / 2, cy + 5, MX, cy + 7, Color(1));
+        it.line(MX, cy + 7, MX + w / 2, cy + 5, Color(1));
+      };
+
+      auto draw_mouth_o = [&](int cy, int r) {
+        it.circle(MX, cy, r, Color(1));
+      };
+
+      auto draw_mouth_line = [&](int cy, int w) {
+        it.line(MX - w, cy, MX + w, cy, Color(1));
+      };
+
+      auto draw_mouth_dizzy = [&](int cy) {
+        it.line(MX - 10, cy, MX - 3, cy + 3, Color(1));
+        it.line(MX - 3, cy + 3, MX + 3, cy - 3, Color(1));
+        it.line(MX + 3, cy - 3, MX + 10, cy, Color(1));
+      };
+
+      // --- Main Logic Start ---
+
+      // HUD Logic
       if (id(hud_active)) {
         it.print(64, 0, id(font_small), TextAlign::TOP_CENTER, "--- STATUS HUD ---");
         it.strftime(0, 18, id(font_small), "Time: %H:%M", id(home_assistant_time).now());
@@ -417,107 +634,9 @@ display:
         return;
       }
 
-      const int EL = 44;
-      const int ER = 84;
-      const int EY = 22;
-      const int MX = 64;
-      const int MY = 50;
-
       uint32_t ms = millis();
       int anim = (ms / 400) % 2;
       bool blink = ((ms / 4500) % 2 == 0) && ((ms % 4500) < 220);
-
-      auto eye_open = [&](int cx, int cy, int r) {
-        it.filled_circle(cx, cy, r, Color(1));
-      };
-      auto eye_closed = [&](int cx, int cy, int w) {
-        it.line(cx - w, cy, cx + w, cy, Color(1));
-      };
-      auto eye_happy = [&](int cx, int cy, int s) {
-        it.line(cx - s, cy + 2, cx, cy - s, Color(1));
-        it.line(cx, cy - s, cx + s, cy + 2, Color(1));
-      };
-      auto eye_surprised = [&](int cx, int cy, int r) {
-        it.circle(cx, cy, r, Color(1));
-        it.filled_circle(cx, cy, 3, Color(1));
-      };
-      auto eye_dizzy = [&](int cx, int cy, int s) {
-        it.line(cx - s, cy - s, cx + s, cy + s, Color(1));
-        it.line(cx - s, cy + s, cx + s, cy - s, Color(1));
-      };
-      auto eye_heart = [&](int cx, int cy) {
-        it.filled_circle(cx - 3, cy - 2, 3, Color(1));
-        it.filled_circle(cx + 3, cy - 2, 3, Color(1));
-        it.line(cx - 6, cy, cx, cy + 6, Color(1));
-        it.line(cx + 6, cy, cx, cy + 6, Color(1));
-        it.line(cx, cy + 6, cx - 6, cy, Color(1));
-      };
-      auto eye_sleepy = [&](int cx, int cy, int r) {
-        it.filled_circle(cx, cy, r, Color(1));
-        it.line(cx - r - 1, cy - 1, cx + r + 1, cy - 1, Color(1));
-      };
-      auto eye_working = [&](int cx, int cy) {
-        it.filled_circle(cx, cy, 6, Color(1));
-        it.filled_rectangle(cx - 1, cy - 6, cx + 1, cy + 6, Color(0));
-      };
-      auto mouth_smile = [&](int cy, int w) {
-        it.line(MX - w, cy - 2, MX - w / 2, cy + 3, Color(1));
-        it.line(MX - w / 2, cy + 3, MX + w / 2, cy + 3, Color(1));
-        it.line(MX + w / 2, cy + 3, MX + w, cy - 2, Color(1));
-      };
-      auto mouth_big_smile = [&](int cy, int w) {
-        it.line(MX - w, cy, MX - w / 2, cy + 5, Color(1));
-        it.line(MX - w / 2, cy + 5, MX + w / 2, cy + 5, Color(1));
-        it.line(MX + w / 2, cy + 5, MX + w, cy, Color(1));
-        it.line(MX - w / 2, cy + 5, MX, cy + 7, Color(1));
-        it.line(MX, cy + 7, MX + w / 2, cy + 5, Color(1));
-      };
-      auto mouth_o = [&](int cy, int r) {
-        it.circle(MX, cy, r, Color(1));
-      };
-      auto mouth_line = [&](int cy, int w) {
-        it.line(MX - w, cy, MX + w, cy, Color(1));
-      };
-      auto mouth_dizzy = [&](int cy) {
-        it.line(MX - 10, cy, MX - 3, cy + 3, Color(1));
-        it.line(MX - 3, cy + 3, MX + 3, cy - 3, Color(1));
-        it.line(MX + 3, cy - 3, MX + 10, cy, Color(1));
-      };
-      auto brow_flat = [&](int cx, int cy) {
-        it.line(cx - 7, cy, cx + 7, cy, Color(1));
-      };
-      auto brow_raise = [&](int cx, int cy, int tilt) {
-        it.line(cx - 7, cy + tilt, cx + 7, cy - tilt, Color(1));
-      };
-      auto brow_furrow = [&](int cx, int cy) {
-        it.line(cx - 7, cy - 1, cx + 7, cy + 2, Color(1));
-      };
-      auto draw_glasses = [&](int cy) {
-        it.rectangle(EL - 11, cy - 9, EL + 11, cy + 9, Color(1));
-        it.rectangle(ER - 11, cy - 9, ER + 11, cy + 9, Color(1));
-        it.line(EL + 11, cy - 4, ER - 11, cy - 4, Color(1));
-        it.line(EL - 11, cy - 1, EL - 18, cy - 3, Color(1));
-        it.line(ER + 11, cy - 1, ER + 18, cy - 3, Color(1));
-      };
-      auto mouth_talk = [&](int cy, int open_r) {
-        if ((ms / 130) % 2) {
-          mouth_o(cy, open_r);
-        } else {
-          mouth_line(cy, open_r);
-        }
-      };
-      auto mouth_smile_or_talk = [&](int cy, int w) {
-        if (id(mouth_talking)) mouth_talk(cy, 4);
-        else mouth_smile(cy, w);
-      };
-      auto mouth_big_or_talk = [&](int cy, int w) {
-        if (id(mouth_talking)) mouth_talk(cy, 5);
-        else mouth_big_smile(cy, w);
-      };
-      auto mouth_o_or_talk = [&](int cy, int r) {
-        if (id(mouth_talking)) mouth_talk(cy, r - 1);
-        else mouth_o(cy, r);
-      };
 
       if (id(random_event_id) != 0 && millis() >= id(random_event_end_ms)) {
         id(random_event_id) = 0;
@@ -526,162 +645,158 @@ display:
       int face = 0;
       const std::string &emo = id(current_emotion).state;
 
-      if (emo == "SMILE :)") {
-        face = 10;
-      } else if (emo == "HAPPY :D") {
-        face = 11;
-      } else if (emo == "HEART EYES <3") {
-        face = 12;
-      } else if (emo == "SURPRISED O.O") {
-        face = 13;
-      } else if (emo == "DIZZY @.@") {
-        face = 14;
-      } else if (id(random_event_id) > 0 && millis() < id(random_event_end_ms)) {
-        face = 29 + id(random_event_id);
-      } else if (id(happiness_level) >= 3) {
-        face = anim ? 22 : 21;
-      } else if (id(happiness_level) == 2) {
-        face = anim ? 17 : 16;
-      } else if (id(happiness_level) == 1) {
-        face = 15;
-      } else {
+
+      // Priority 1: Active States
+      if (id(current_state) != id(STATE_IDLE)) {
+        face = id(current_state);
+      } 
+      
+      // Priority 2: Idle/Hourly states
+      else if (id(random_event_id) > 0 && ms < id(random_event_end_ms)) face = id(STATE_EVENT_BASE) + id(random_event_id);
+      else if (id(happiness_level) >= 3) face = anim ? id(STATE_HEART_EYES_ANIM) : id(STATE_HEART_EYES);
+      else if (id(happiness_level) == 2) face = anim ? id(STATE_HAPPY_ANIM) : id(STATE_HAPPY);
+      else if (id(happiness_level) == 1) face = id(STATE_SMILE);
+      else {
         int hour = id(home_assistant_time).now().hour;
-        if (hour >= 7 && hour < 9) {
-          face = 1;
-        } else if (hour >= 9 && hour < 12) {
-          face = 2;
-        } else if (hour >= 12 && hour < 13) {
-          face = 3;
-        } else if (hour >= 13 && hour < 18) {
-          face = anim ? 5 : 4;
-        } else if (hour >= 18 && hour < 22) {
-          face = 6;
-        } else if (hour >= 22 || hour < 7) {
-          face = 7;
-        } else {
-          face = 0;
-        }
+        if (hour >= 7 && hour < 9) face = id(STATE_SLEEPY_MAPLE); // just woke up
+        else if (hour >= 9 && hour < 12) face = id(STATE_WORKING); // morning work mode
+        else if (hour >= 12 && hour < 13) face = 3; // lunch surprise (?) — leave as is, unclear intent
+        else if (hour >= 13 && hour < 18) face = anim ? id(STATE_FOCUS) : id(STATE_BORED); // post-lunch zoning out
+        else if (hour >= 18 && hour < 22) face = id(STATE_SAD); // evening blues
+        else if (hour >= 22 || hour < 7) face = id(STATE_SLEEP); // night time
+        else face = id(STATE_IDLE);
       }
 
       int y_off = 0;
-      if (face == 5) {
-        y_off = anim ? -3 : 3;
-      }
+      if (face == id(STATE_FOCUS)) y_off = anim ? -3 : 3;
 
+      // Draw Based on Face Index
       switch (face) {
-        case 14:
-          eye_dizzy(EL, EY + y_off, 7);
-          eye_dizzy(ER, EY + y_off, 7);
-          mouth_dizzy(MY);
+        case id(STATE_DIZZY):
+          draw_eye_dizzy(EL, EY + y_off, 7);
+          draw_eye_dizzy( ER, EY + y_off, 7);
+          draw_mouth_dizzy( MY);
           break;
-        case 13:
-          eye_surprised(EL, EY + y_off, 10);
-          eye_surprised(ER, EY + y_off, 10);
-          mouth_o(MY, 6);
+        case id(STATE_SURPRISED):
+          draw_eye_surprised( EL, EY + y_off, 10);
+          draw_eye_surprised( ER, EY + y_off, 10);
+          draw_mouth_o( MY, 6);
           break;
-        case 12:
-          eye_heart(EL, EY + y_off - 1);
-          eye_heart(ER, EY + y_off - 1);
-          mouth_big_smile(MY, 14);
+        case id(STATE_DIZZY_MAPLE): // event face: idle-dizzy maple variant
+          draw_eye_dizzy(EL, EY + y_off - 2, 8);
+          draw_eye_dizzy( ER, EY + y_off - 2, 8);
+          draw_mouth_line( MY + 1, 5);
           break;
-        case 11:
-          eye_happy(EL, EY + y_off, 7);
-          eye_happy(ER, EY + y_off, 7);
-          mouth_big_smile(MY, 14);
+        case id(STATE_HEART_MAPLE): // event face: idle-heart maple variant
+          draw_eye_heart( EL, EY + y_off - 1);
+          draw_eye_heart(ER, EY + y_off - 1);
+          draw_mouth_big_smile( MY, 14);
           break;
-        case 10:
+        case id(STATE_SMILE_ACTIVE): // active-state smile (face_state=10, triggered)
           if (blink) {
-            eye_closed(EL, EY + y_off, 7);
-            eye_closed(ER, EY + y_off, 7);
+            draw_eye_closed( EL, EY + y_off, 7);
+            draw_eye_closed( ER, EY + y_off, 7);
           } else {
-            eye_open(EL, EY + y_off, 7);
-            eye_open(ER, EY + y_off, 7);
+            draw_eye_open( EL, EY + y_off, 7);
+            draw_eye_open( ER, EY + y_off, 7);
           }
-          mouth_smile(MY, 10);
+          draw_mouth_smile( MY, 10);
           break;
-        case 22:
-          eye_happy(EL, EY + y_off, 8);
-          eye_happy(ER, EY + y_off, 8);
-          mouth_smile(MY, 11);
+        case id(STATE_HEART_EYES_ANIM): // happiness=3 anim variant
+          draw_eye_happy( EL, EY + y_off, 8);
+          draw_eye_happy( ER, EY + y_off, 8);
+          draw_mouth_smile( MY, 11);
           break;
-        case 21:
-          eye_heart(EL, EY + y_off - 1);
-          eye_heart(ER, EY + y_off - 1);
-          mouth_big_smile(MY, 15);
+        case id(STATE_HEART_EYES): // happiness=3 stable
+          draw_eye_heart( EL, EY + y_off - 1);
+          draw_eye_heart(ER, EY + y_off - 1);
+          draw_mouth_big_smile( MY, 15);
           break;
-        case 17:
-          eye_happy(EL, EY + y_off, 7);
-          eye_happy(ER, EY + y_off, 7);
-          mouth_smile(MY, 12);
+        case id(STATE_HAPPY_ANIM): // happiness=2 anim variant — happy V-eyes
+          draw_eye_happy( EL, EY + y_off, 7);
+          draw_eye_happy( ER, EY + y_off, 7);
+          draw_mouth_smile( MY, 12);
           break;
-        case 16:
+        case id(STATE_HAPPY): // happiness=2 stable — open eyes + big smile (distinct from anim)
           if (blink) {
-            eye_closed(EL, EY + y_off, 8);
-            eye_closed(ER, EY + y_off, 8);
+            draw_eye_closed( EL, EY + y_off, 8);
+            draw_eye_closed( ER, EY + y_off, 8);
           } else {
-            eye_open(EL, EY + y_off, 8);
-            eye_open(ER, EY + y_off, 8);
+            draw_eye_open( EL, EY + y_off, 8);
+            draw_eye_open( ER, EY + y_off, 8);
           }
-          mouth_big_smile(MY, 13);
+          draw_mouth_big_smile( MY, 13);
           break;
-        case 15:
+        case id(STATE_SMILE): // happiness=1 stable (active smile)
           if (blink) {
-            eye_closed(EL, EY + y_off, 7);
-            eye_closed(ER, EY + y_off, 7);
+            draw_eye_closed( EL, EY + y_off, 7);
+            draw_eye_closed( ER, EY + y_off, 7);
           } else {
-            eye_open(EL, EY + y_off, 7);
-            eye_open(ER, EY + y_off, 7);
+            draw_eye_open( EL, EY + y_off, 7);
+            draw_eye_open( ER, EY + y_off, 7);
           }
-          mouth_smile(MY, 9);
+          draw_mouth_smile( MY, 9);
           break;
-        case 7:
-          eye_closed(EL, EY, 8);
-          eye_closed(ER, EY, 8);
-          mouth_line(MY + 2, 4);
+        case id(STATE_SLEEP): // face=7: sleeping
+          draw_eye_closed( EL, EY, 8);
+          draw_eye_closed( ER, EY, 8);
+          draw_mouth_line( MY + 2, 4);
           break;
-        case 6:
+        case id(STATE_SAD): // face=6: sad (stable variant)
           if (blink) {
-            eye_closed(EL, EY, 7);
-            eye_closed(ER, EY, 7);
+            draw_eye_closed( EL, EY, 7);
+            draw_eye_closed( ER, EY, 7);
           } else {
-            eye_open(EL, EY, 7);
-            eye_open(ER, EY, 7);
+            draw_eye_open( EL, EY, 7);
+            draw_eye_open( ER, EY, 7);
           }
-          mouth_smile(MY, 8);
+          draw_mouth_smile( MY, 8);
           break;
-        case 5:
-          eye_open(EL - 4, EY + y_off, 7);
-          eye_open(ER - 4, EY + y_off, 7);
-          mouth_smile(MY, 9);
+        case id(STATE_FOCUS): // face=5: focused (looking left)
+          draw_eye_open( EL - 4, EY + y_off, 7);
+          draw_eye_open( ER - 4, EY + y_off, 7);
+          draw_mouth_smile( MY, 9);
           break;
-        case 4:
-          eye_open(EL + 4, EY + y_off, 7);
-          eye_open(ER + 4, EY + y_off, 7);
-          mouth_line(MY, 5);
+        case id(STATE_BORED): // face=4: bored (looking right)
+          draw_eye_open( EL + 4, EY + y_off, 7);
+          draw_eye_open( ER + 4, EY + y_off, 7);
+          draw_mouth_line( MY, 5);
           break;
-        case 3:
-          eye_open(EL, EY, 8);
-          eye_open(ER, EY, 8);
-          mouth_o(MY, 5);
+        case id(STATE_YAWNING_MAPLE): // event face: yawning maple variant
+          draw_eye_open( EL, EY, 8);
+          draw_eye_open( ER, EY, 8);
+          draw_mouth_o( MY, 5);
           break;
-        case 2:
-          eye_working(EL, EY);
-          eye_working(ER, EY);
-          mouth_line(MY, 6);
+        case id(STATE_SAD_MAPLE): // event face: sad maple (event_id=5) — droopy eyes
+          it.filled_circle( EL, EY - 1, 7, Color(1));
+          it.filled_circle(ER, EY - 1, 7, Color(1));
+          it.line( EL + 2, EY, EL, EY + 3, Color(0)); // dark pupil offset down
+          it.line(ER + 2, EY, ER, EY + 3, Color(0));
+          draw_mouth_line( MY - 1, 6); // slight frown
           break;
-        case 1:
-          eye_sleepy(EL, EY, 7);
-          eye_sleepy(ER, EY, 7);
-          mouth_o(MY, 4);
+        case id(STATE_BORED_MAPLE): // event face: bored maple (event_id=6) — rolling eyes
+          it.filled_circle( EL, EY + 2, 7, Color(1));
+          it.filled_circle(ER, EY + 2, 7, Color(1));
+          draw_mouth_line( MY - 2, 5); // slightly tilted mouth
+          break;
+        case id(STATE_WORKING): // active-state working (face_state=2)
+          draw_eye_working( EL, EY);
+          draw_eye_working( ER, EY);
+          draw_mouth_line( MY, 6);
+          break;
+        case id(STATE_SLEEPY_MAPLE): // event face: sleepy maple variant
+          draw_eye_sleepy( EL, EY, 7);
+          draw_eye_sleepy( ER, EY, 7);
+          draw_mouth_o( MY, 4);
           break;
         default:
           if (blink) {
-            eye_closed(EL, EY, 7);
-            eye_closed(ER, EY, 7);
+            draw_eye_closed( EL, EY, 7);
+            draw_eye_closed( ER, EY, 7);
           } else {
-            eye_open(EL, EY, 7);
-            eye_open(ER, EY, 7);
+            draw_eye_open( EL, EY, 7);
+            draw_eye_open( ER, EY, 7);
           }
-          mouth_line(MY, 5);
+          draw_mouth_line( MY, 5);
           break;
       }
