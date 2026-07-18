@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "author": "AI Assistant",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-s3-devkitc-1", "id": "esp", "top": -48, "left": -76.7, "attrs": {} },
+    { "type": "board-ssd1306", "id": "oled", "top": -140.8, "left": 134.4, "attrs": {} },
+    { "type": "wokwi-mpu6050", "id": "gyro", "top": 28.8, "left": 144, "attrs": {} },
+    { "type": "wokwi-pushbutton", "id": "touch", "top": -224.2, "left": -115.2, "attrs": { "color": "green", "label": "TTP223 Touch" } },
+    { "type": "wokwi-buzzer", "id": "buzzer", "top": 153.6, "left": -28.8, "attrs": { "volume": "0.2" } },
+    { "type": "wokwi-transistor-npn", "id": "q1", "top": 172.8, "left": -115.2, "attrs": {} },
+    { "type": "wokwi-resistor", "id": "r_base", "top": 115.2, "left": -144, "attrs": { "value": "1000" } },
+    { "type": "wokwi-diode", "id": "d_flyback", "top": 115.2, "left": 28.8, "attrs": {} },
+    { "type": "wokwi-led", "id": "vib_motor_led", "top": -38.4, "left": 144, "attrs": { "color": "red", "label": "Vib Motor IN" } }
+  ],
+  "connections": [
+    [ "esp:GND.1", "oled:GND", "black", [ "h:0" ] ],
+    [ "esp:GND.1", "gyro:GND", "black", [ "h:0" ] ],
+    [ "esp:GND.1", "touch:2.g", "black", [ "h:0" ] ],
+    [ "esp:GND.1", "q1:E", "black", [ "h:0" ] ],
+    [ "esp:GND.1", "vib_motor_led:C", "black", [ "h:0" ] ],
+    
+    [ "esp:3V3.1", "oled:VCC", "red", [ "h:0" ] ],
+    [ "esp:3V3.1", "gyro:VCC", "red", [ "h:0" ] ],
+    [ "esp:3V3.1", "touch:1.v", "red", [ "h:0" ] ],
+    
+    [ "esp:5V", "buzzer:1", "red", [ "h:0" ] ],
+    [ "esp:5V", "d_flyback:A", "red", [ "h:0" ] ],
+    
+    [ "esp:4", "oled:SDA", "blue", [ "h:0" ] ],
+    [ "esp:4", "gyro:SDA", "blue", [ "h:0" ] ],
+    [ "esp:5", "oled:SCL", "yellow", [ "h:0" ] ],
+    [ "esp:5", "gyro:SCL", "yellow", [ "h:0" ] ],
+    
+    [ "esp:1", "touch:2.p", "orange", [ "h:0" ] ],
+    
+    [ "esp:6", "r_base:1", "purple", [ "h:0" ] ],
+    [ "r_base:2", "q1:B", "purple", [ "h:0" ] ],
+    [ "q1:C", "buzzer:2", "purple", [ "h:0" ] ],
+    [ "q1:C", "d_flyback:C", "purple", [ "h:0" ] ],
+    
+    [ "esp:7", "vib_motor_led:A", "orange", [ "h:0" ] ]
+  ],
+  "dependencies": {}
+}

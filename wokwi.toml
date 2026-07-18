@@ -1,0 +1,8 @@
+[wokwi]
+version = 1
+elf = ".esphome/build/esphome-web-e4da60/build/esphome-web-e4da60.elf"
+firmware = ".esphome/build/esphome-web-e4da60/build/esphome-web-e4da60.bin"
+
+[[net.forward]]
+from = "localhost:8180"
+to = "target:80"
