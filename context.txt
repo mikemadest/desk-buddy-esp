@@ -19,5 +19,25 @@ Mind that the full code is expected to be in one file, because of how esp home w
 Check https://esphome.io/ for information about esp home or https://esphome.io/guides/yaml/ for the configuration yaml.
 
 Commands:
-1. validate the configuration: python -m esphome config main.yaml
-2. compile the code: python -m esphome compile main.yaml
+1. validate the configuration: `python -m esphome config main.yaml`
+2. compile the code: `python -m esphome compile main.yaml`
+
+----------------------------------
+
+INSTRUCTIONS FOR THIS PROJECT
+
+CRITICAL:
+If you make any changes, you should make sure the update is correct with this:
+1. validate the configuration: `python -m esphome config main.yaml`
+2. compile the code: `python -m esphome compile main.yaml`
+
+Each command can take a bit of time and you should wait for it to complete before analysing the results. 
+Progress step by step so each iteration is easy to evaluate. 
+For example, if you make a change on the globals:
+1. confirm with the documentations (https://esphome.io/guides/yaml/)
+2. change one global
+3. running the validate command, wait for the results and analyse the output. If it fail, iterate by investigating why it failed, based on the command output and making changes, going back to 1.
+4. if 3 is successful run the compile command, analyse the output. If it fail, iterate by investigating why it failed, based on the command output and making changes, going back to 1.
+
+
+If you have any doubts, ask me and pause.
