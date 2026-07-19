@@ -1,0 +1,23 @@
+Desk buddy project
+
+
+Context: this is the code for an ESP Home project, 
+based on yaml and c code (via lambda blocks). 
+My purpose is to create a desk buddy project that react to touch and movement, 
+make sounds via the passive buzzer and display eyes and mouth on screen. 
+
+The hardware is an esp-s3 zero (they have one rgb w2812 led on board), 
+one .96 mono oled screen 128x64 pixels, one vibration motor. 
+Don't be too concerned by the hardware for now: 
+it's working and the program is doing what it should.
+
+Project folder: C:\Projects\DeskBuddyEsp32\desk-buddy-esp\
+this context: C:\Projects\DeskBuddyEsp32\desk-buddy-esp\context.txt
+Full project code : C:\Projects\DeskBuddyEsp32\desk-buddy-esp\main.yaml
+
+Mind that the full code is expected to be in one file, because of how esp home works. 
+Check https://esphome.io/ for information about esp home or https://esphome.io/guides/yaml/ for the configuration yaml.
+
+Commands:
+1. validate the configuration: python -m esphome config main.yaml
+2. compile the code: python -m esphome compile main.yaml
