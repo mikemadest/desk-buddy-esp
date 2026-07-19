@@ -11,11 +11,20 @@ one .96 mono oled screen 128x64 pixels, one vibration motor.
 Don't be too concerned by the hardware for now: 
 it's working and the program is doing what it should.
 
-Mind that the full code is expected to be in one file, because of how esp home works. 
-Check  https://esphome.io/guides/yaml/ for information about esp home for the configuration yaml.
+The project uses main.yaml plus C++ includes under src/ (via esphome includes:).
+Check https://esphome.io/guides/yaml/ and https://esphome.io/components/esphome/ (includes).
 
-Your focus is main.yaml: this is a YAML file format, with lambda sections that contains c code.
-Not everything from c may be available, confirm with esp home API.
+Focus files:
+- main.yaml — hardware, automations, scripts, thin lambdas
+- src/buddy_states.h — face/emotion constants
+- src/buddy_faces.h / src/buddy_faces.cpp — face selection, transitions, procedural draw
+- references/ — style inspiration for procedural faces (bigger eyes, blush, look/wink)
+- assets/ — original bitmaps kept for reference only (not embedded)
+Faces are fully procedural on a shared layout; neutral bridge between expression
+families; heart eyes pulse by scaling procedural hearts. Shake uses intensity bands
+(curious / surprised / dizzy @@→XX). Touch: short=pet, long=HUD, triple=face gallery.
+Not everything from C++ may be available in lambdas; confirm with ESPHome API.
+id() does not work inside included .cpp files — pass values from lambdas.
 
 Commands:
 1. validate the configuration: `python -m esphome config main.yaml`
