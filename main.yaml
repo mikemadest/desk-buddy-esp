@@ -511,7 +511,11 @@ script:
                 }
 
                 id(random_event_id) = evt;
-                id(random_event_end_ms) = millis() + 2000 + (random() % 800);
+                // Yawn needs the full open/hold/close cycle (~4s)
+                if (evt == 3)
+                  id(random_event_end_ms) = millis() + 4200;
+                else
+                  id(random_event_end_ms) = millis() + 2000 + (random() % 800);
             - if:
                 condition:
                   lambda: 'return id(random_event_id) == 5 || id(random_event_id) == 7;'
@@ -526,7 +530,7 @@ font:
     glyphsets: []
     glyphs:
       # HUD + face-gallery labels (unique codepoints only)
-      - " -%./0123456789:ABCDEFHIKLMNOPRSTUWYZdeimopt"
+      - " -%./0123456789:ABCDEFHIKLMNOPRSTUWXYdeimopt"
 
 display:
   - platform: ssd1306_i2c
@@ -558,16 +562,14 @@ display:
         it.printf(0, 0, id(font_small), "%d/%d %s",
                   id(face_gallery_index) + 1, buddy_gallery_count(),
                   buddy_gallery_label(id(face_gallery_index)));
-        // Demo dizzy phases in gallery: @@ then XX on a 2.5s loop
-        if (face == STATE_DIZZY || face == STATE_DIZZY_MAPLE) {
-          dsev = true;
-          dstart = ms - (ms % 2500);
-        }
       } else {
         buddy_expire_random_event(id(random_event_id), id(random_event_end_ms), ms);
+        const bool has_temp = id(current_temperature).has_state();
+        const float temp_c = has_temp ? id(current_temperature).state : 0.0f;
         const int target = buddy_select_face(
             id(current_state), id(happiness_level), id(random_event_id),
-            id(random_event_end_ms), ms, id(home_assistant_time).now().hour);
+            id(random_event_end_ms), ms, id(home_assistant_time).now().hour,
+            has_temp, temp_c);
         face = buddy_present_face(target, ms);
       }
 

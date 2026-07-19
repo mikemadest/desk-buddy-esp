@@ -32,6 +32,13 @@ enum : int {
   STATE_SAD_MAPLE = 34,
   STATE_BORED_MAPLE = 35,
   STATE_THUMBUP_MAPPLE = 36,
+  // Temperature comfort (selected from room sensor when idle)
+  STATE_HOT_MILD = 40,     // >25°C: 2–3 sweat drops
+  STATE_HOT_WARM = 41,     // 28–30°C: 3–4 sweat drops
+  STATE_HOT_OVER = 42,     // >30°C: X eyes + sweat
+  STATE_COLD_CHILLY = 43,  // 18–19°C: small serious eyes, inverse mouth
+  STATE_COLD_SAD = 44,     // ~17–18°C: sad eyes + inverse grin
+  STATE_COLD_FREEZE = 45,  // <17°C: X eyes + inverse grin
 };
 
 // Returns a label for active interaction states; nullptr = keep previous / unknown.
