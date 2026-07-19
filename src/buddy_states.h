@@ -39,6 +39,8 @@ enum : int {
   STATE_COLD_CHILLY = 43,  // 18–19°C: small serious eyes, inverse mouth
   STATE_COLD_SAD = 44,     // ~17–18°C: sad eyes + inverse grin
   STATE_COLD_FREEZE = 45,  // <17°C: X eyes + inverse grin
+  // Internal presentation-only state used between expression families.
+  STATE_TRANSITION_BLINK = 90,
 };
 
 // Returns a label for active interaction states; nullptr = keep previous / unknown.

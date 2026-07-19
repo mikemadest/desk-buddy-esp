@@ -71,6 +71,8 @@ output:
 rtttl:
   output: buzzer_pwm
   id: robot_audio
+  # Passive buzzers are piercing at close range; keep cues intentionally quiet.
+  gain: 18%
 
 light:
   - platform: esp32_rmt_led_strip
@@ -120,8 +122,18 @@ sensor:
       id: accel_x
       internal: true
       filters:
+        # Event gate: forwards the current acceleration only after a large enough change.
         - delta: 3.0
       on_value_range:
+        - below: -4.5
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(motion_busy) && !id(hud_active) && !id(face_gallery_active);'
+                then:
+                  - script.execute:
+                      id: handle_shake
+                      intensity: !lambda 'return fabsf(x);'
         - above: 4.5
           then:
             - if:
@@ -183,7 +195,15 @@ switch:
   - platform: gpio
     pin: GPIO7
     id: vib_motor
-    name: "Vibration Actuator"
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Buddy Sounds"
+    id: sound_enabled
+    icon: "mdi:volume-low"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
 
 binary_sensor:
   - platform: gpio
@@ -209,12 +229,15 @@ binary_sensor:
               id(hud_active) = false;
               if (id(face_gallery_active)) id(face_gallery_index) = 0;
               id(last_interaction_ms) = millis();
-          - rtttl.play: "gallery:d=32,o=6,b=220:c,e,g"
+          - script.execute:
+              id: play_buddy_sound
+              sound: "gallery:d=32,o=5,b=180:c,16p,e"
 
       # Single short tap — next gallery face, or pet in normal mode
       - timing:
           - ON for at most 400ms
-          - OFF for at least 250ms
+          # Longer than triple-click's maximum gap, so a pending triple cannot pet first.
+          - OFF for at least 450ms
         then:
           - if:
               condition:
@@ -223,7 +246,9 @@ binary_sensor:
                 - lambda: |-
                     id(face_gallery_index) = (id(face_gallery_index) + 1) % buddy_gallery_count();
                     id(last_interaction_ms) = millis();
-                - rtttl.play: "tick:d=32,o=7,b=300:c"
+                - script.execute:
+                    id: play_buddy_sound
+                    sound: "tick:d=32,o=5,b=180:g"
               else:
                 - if:
                     condition:
@@ -243,15 +268,28 @@ binary_sensor:
                 - lambda: |-
                     id(face_gallery_active) = false;
                     id(last_interaction_ms) = millis();
-                - rtttl.play: "gallery:d=32,o=5,b=200:g,e,c"
+                - script.execute:
+                    id: play_buddy_sound
+                    sound: "gallery:d=32,o=5,b=170:g,16p,c"
               else:
                 - if:
                     condition:
                       lambda: 'return !id(motion_busy);'
                     then:
                       - lambda: 'id(hud_active) = !id(hud_active);'
-                      - rtttl.play: "hud_toggle:d=32,o=6,b=200:g,c"
+                      - script.execute:
+                          id: play_buddy_sound
+                          sound: "hud:d=32,o=5,b=170:e,16p,c"
                       - lambda: 'id(last_interaction_ms) = millis();'
+
+button:
+  - platform: template
+    name: "Buddy Haptic Test"
+    icon: "mdi:vibrate"
+    on_press:
+      - script.execute:
+          id: haptic_pulse
+          duration_ms: 100
 
 interval:
   # Periodic life tick — random idle animations and lonely mode checks
@@ -309,18 +347,47 @@ globals:
 
 # --- Main Scripts ---
 script:
+  # One audio owner: stop any prior cue, respect mute, then play a short motif.
+  - id: play_buddy_sound
+    mode: restart
+    parameters:
+      sound: string
+    then:
+      - rtttl.stop:
+          id: robot_audio
+      - if:
+          condition:
+            switch.is_on: sound_enabled
+          then:
+            - rtttl.play:
+                id: robot_audio
+                rtttl: !lambda 'return sound;'
+
+  - id: haptic_pulse
+    mode: restart
+    parameters:
+      duration_ms: int
+    then:
+      - switch.turn_on: vib_motor
+      - delay: !lambda |-
+          if (duration_ms < 20) return 20;
+          if (duration_ms > 250) return 250;
+          return duration_ms;
+      - switch.turn_off: vib_motor
+
   - id: handle_shake
     mode: single
     parameters:
       intensity: float
     then:
-      - lambda: |-
-          uint32_t idle_ms = millis() - id(last_interaction_ms);
-          if (idle_ms < 2500) return; // Cooldown — avoid rapid retriggers
-          id(last_interaction_ms) = millis();
-      - script.execute:
-          id: handle_motion
-          intensity: !lambda 'return intensity;'
+      - if:
+          condition:
+            lambda: 'return (uint32_t) (millis() - id(last_interaction_ms)) >= 2500;'
+          then:
+            - lambda: 'id(last_interaction_ms) = millis();'
+            - script.execute:
+                id: handle_motion
+                intensity: !lambda 'return intensity;'
 
   - id: apply_mood_light
     then:
@@ -359,17 +426,20 @@ script:
           switch (id(happiness_level)) {
             case 1:
                id(current_state) = STATE_SMILE; // happiness=1 → smile face
-              id(robot_audio).play("tap1:d=32,o=6,b=200:c,e");
               break;
             case 2:
                id(current_state) = STATE_HAPPY; // happiness=2 → happy face
-              id(robot_audio).play("tap2:d=32,o=6,b=240:c,e,g");
               break;
             default:
               id(current_state) = STATE_HEART_EYES; // happiness=3 → heart eyes
-              id(robot_audio).play("tap3:d=32,o=6,b=280:c,e,g,c7,e7");
               break;
           }
+      - script.execute:
+          id: play_buddy_sound
+          sound: !lambda |-
+            if (id(happiness_level) >= 3) return std::string("love:d=32,o=5,b=190:e,16p,g");
+            if (id(happiness_level) == 2) return std::string("happy:d=32,o=5,b=180:c,16p,e");
+            return std::string("pet:d=32,o=5,b=160:c");
       - script.execute: mouth_talk_pet
       - light.turn_on:
           id: onboard_neopixel
@@ -377,9 +447,9 @@ script:
           red: 1.0
           green: 0.25
           blue: 0.55
-      - switch.turn_on: vib_motor
-      - delay: 100ms
-      - switch.turn_off: vib_motor
+      - script.execute:
+          id: haptic_pulse
+          duration_ms: 100
       - script.execute: clear_pet_emotion
       - script.execute: happiness_decay
 
@@ -408,6 +478,9 @@ script:
     parameters:
       intensity: float
     then:
+      # A motion reaction owns the face/mouth until it completes.
+      - script.stop: clear_pet_emotion
+      - script.stop: mouth_talk_pet
       - lambda: |-
           id(current_state) = STATE_IDLE;
           id(motion_busy) = true;
@@ -419,14 +492,17 @@ script:
             id(dizzy_severe) = (intensity >= 11.0);
             id(dizzy_started_ms) = millis();
             id(current_state) = STATE_DIZZY;
-            id(robot_audio).play("dizzy:d=16,o=5,b=200:g,f,e,d,c");
           } else if (intensity >= 7.0) {
             id(current_state) = STATE_SURPRISED;
-            id(robot_audio).play("surprise:d=16,o=6,b=240:g,g");
           } else {
             id(current_state) = STATE_WORKING;
-            id(robot_audio).play("peek:d=16,o=6,b=300:e,e");
           }
+      - script.execute:
+          id: play_buddy_sound
+          sound: !lambda |-
+            if (intensity >= 9.0f) return std::string("dizzy:d=32,o=5,b=170:g,f,16p,d");
+            if (intensity >= 7.0f) return std::string("surprise:d=32,o=6,b=170:g");
+            return std::string("curious:d=32,o=5,b=160:c,16p,e");
       - script.execute: mouth_talk_motion
       - light.turn_on:
           id: onboard_neopixel
@@ -434,9 +510,9 @@ script:
           red: 0.5
           green: 0.5
           blue: 0.0
-      - switch.turn_on: vib_motor
-      - delay: 150ms
-      - switch.turn_off: vib_motor
+      - script.execute:
+          id: haptic_pulse
+          duration_ms: 150
       - delay: 3s
       - lambda: |-
           id(current_state) = STATE_IDLE;
@@ -467,7 +543,9 @@ script:
           then:
             - lambda: |-
                 id(mouth_talking) = true;
-                id(robot_audio).play("idle:d=32,o=7,b=320:e,c");
+            - script.execute:
+                id: play_buddy_sound
+                sound: "hello:d=32,o=5,b=140:e,16p,c"
             - delay: 350ms
             - lambda: 'id(mouth_talking) = false;'
 
@@ -485,11 +563,11 @@ script:
 
                 // Pick a trigger chance from the table (first entry where threshold <= idle)
                 struct { int64_t ms; uint8_t chance; } TABLE[] = {
-                  { 0,      0 },   // fresh — no event
-                  { 60000,  5 },  // < 1 min: rare (5%)
-                  { 300000, 14 }, // 1-5 min: occasional chirp (14%)
-                  { 900000, 28 }, // 5-15 min: moderate interest (28%)
-                  { 1800000,45 }, // 30+ min: lonely mode (45%)
+                  { 0,       0 },  // under 1 min: no event
+                  { 60000,   5 },  // 1–5 min: rare
+                  { 300000, 14 },  // 5–15 min: occasional
+                  { 900000, 28 },  // 15–30 min: moderate
+                  { 1800000,45 },  // 30+ min: lonely mode
                 };
                 int pick = -1;
                 for (int i = 0; i < 5; i++) {
@@ -499,9 +577,14 @@ script:
                 if (pick >= 4) id(lonely_mode) = true;
                 if (pick < 0 || (random() % 100) >= TABLE[pick].chance) return;
 
-                // Pick event index: early idle favors calm events, later unlocks all
-                int evt_max = (pick >= 3) ? 8 : 6; // calm events only before 15 min
-                int evt = random() % evt_max;
+                // Explicit pools keep enum ordering from silently changing personality.
+                const int CALM_EVENTS[] = {0, 2, 3, 4, 6}; // sleepy, heart, yawn, work, bored
+                const int ALL_EVENTS[] = {0, 1, 2, 3, 4, 5, 6, 7};
+                int evt;
+                if (pick >= 3)
+                  evt = ALL_EVENTS[random() % 8];
+                else
+                  evt = CALM_EVENTS[random() % 5];
                 // Lonely: usually beg for attention (thumbs-up); if mood is 0, sometimes cry
                 if (id(lonely_mode)) {
                   if (id(happiness_level) <= 0 && (random() % 100) < 40)
@@ -530,7 +613,7 @@ font:
     glyphsets: []
     glyphs:
       # HUD + face-gallery labels (unique codepoints only)
-      - " -%./0123456789:ABCDEFHIKLMNOPRSTUWXYdeimopt"
+      - " -%./0123456789:ABCDEFHIKLMNOPRSTUWXYZdeimopt"
 
 display:
   - platform: ssd1306_i2c
@@ -566,11 +649,19 @@ display:
         buddy_expire_random_event(id(random_event_id), id(random_event_end_ms), ms);
         const bool has_temp = id(current_temperature).has_state();
         const float temp_c = has_temp ? id(current_temperature).state : 0.0f;
+        const auto clock = id(home_assistant_time).now();
+        const int hour = clock.is_valid() ? clock.hour : -1;
         const int target = buddy_select_face(
             id(current_state), id(happiness_level), id(random_event_id),
-            id(random_event_end_ms), ms, id(home_assistant_time).now().hour,
+            id(random_event_end_ms), ms, hour,
             has_temp, temp_c);
         face = buddy_present_face(target, ms);
+      }
+
+      static int last_reported_face = STATE_NONE;
+      if (face != STATE_TRANSITION_BLINK && face != last_reported_face) {
+        id(current_emotion).publish_state(buddy_face_label(face));
+        last_reported_face = face;
       }
 
       buddy_draw_face(it, face, ms, id(mouth_talking), dsev, dstart);

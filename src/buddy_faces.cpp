@@ -14,7 +14,8 @@ constexpr int MX = 64;
 constexpr int MY = 50;
 constexpr int EYE_R = 10;
 
-constexpr uint32_t TRANSITION_MS = 280;
+// Display refreshes every 200ms: 480ms guarantees two deliberate blink frames.
+constexpr uint32_t TRANSITION_MS = 480;
 constexpr uint32_t BLINK_CLOSED_MS = 200;
 constexpr uint32_t WINK_CLOSED_MS = 400;
 constexpr uint32_t SLEEPY_BLINK_OPEN_LO = 700;
@@ -71,6 +72,7 @@ enum Brow : int {
 int s_current_family = FAM_NEUTRAL;
 bool s_in_transition = false;
 uint32_t s_transition_until = 0;
+int s_temperature_face = STATE_NONE;
 
 bool s_blink_inited = false;
 bool s_blink_closed = false;
@@ -119,7 +121,7 @@ void blink_update(uint32_t now_ms, bool sleepy_mode) {
                                              : rand_range(1800, 3500));
     return;
   }
-  if (now_ms < s_blink_next_ms) {
+  if (!buddy_time_reached(now_ms, s_blink_next_ms)) {
     return;
   }
   if (!s_blink_closed) {
@@ -150,7 +152,7 @@ SleepyPhase sleepy_phase(uint32_t now_ms) {
 }
 
 void gaze_update(uint32_t now_ms) {
-  if (now_ms < s_gaze_until) {
+  if (!buddy_time_reached(now_ms, s_gaze_until)) {
     return;
   }
   const int r = random() % 100;
@@ -166,7 +168,7 @@ void gaze_update(uint32_t now_ms) {
 
 void bored_wink_update(uint32_t now_ms) {
   if (s_bored_wink) {
-    if (now_ms >= s_bored_wink_until) {
+    if (buddy_time_reached(now_ms, s_bored_wink_until)) {
       s_bored_wink = false;
       s_bored_next_wink_ms = now_ms + rand_range(6000, 12000);
     }
@@ -175,7 +177,7 @@ void bored_wink_update(uint32_t now_ms) {
   if (s_bored_next_wink_ms == 0) {
     s_bored_next_wink_ms = now_ms + rand_range(5000, 9000);
   }
-  if (now_ms >= s_bored_next_wink_ms) {
+  if (buddy_time_reached(now_ms, s_bored_next_wink_ms)) {
     s_bored_wink = true;
     s_bored_wink_until = now_ms + WINK_CLOSED_MS;
   }
@@ -466,6 +468,41 @@ void draw_sweat(Display &it, int count) {
   }
 }
 
+void draw_cold_marks(Display &it, int face, uint32_t now_ms) {
+  const int shiver = ((now_ms / 400) % 2) ? 1 : -1;
+  it.line(15, 17 + shiver, 11, 21 + shiver, Color(1));
+  it.line(11, 21 + shiver, 15, 25 + shiver, Color(1));
+  it.line(113, 17 - shiver, 117, 21 - shiver, Color(1));
+  it.line(117, 21 - shiver, 113, 25 - shiver, Color(1));
+
+  if (face == STATE_COLD_FREEZE) {
+    // Tiny snow crystals make the cause of the shared "I'm dead" X eyes explicit.
+    constexpr int SX[] = {22, 106};
+    constexpr int SY[] = {9, 11};
+    for (int i = 0; i < 2; i++) {
+      it.line(SX[i] - 3, SY[i], SX[i] + 3, SY[i], Color(1));
+      it.line(SX[i], SY[i] - 3, SX[i], SY[i] + 3, Color(1));
+      it.line(SX[i] - 2, SY[i] - 2, SX[i] + 2, SY[i] + 2, Color(1));
+      it.line(SX[i] - 2, SY[i] + 2, SX[i] + 2, SY[i] - 2, Color(1));
+    }
+  }
+}
+
+void draw_thumb_up(Display &it) {
+  // Compact hand at the cheek: outlined wrist/palm plus a raised thumb.
+  it.rectangle(103, 44, 8, 12, Color(1));
+  it.filled_rectangle(105, 46, 4, 8, Color(1));
+  it.line(103, 47, 99, 44, Color(1));
+  it.line(99, 44, 100, 40, Color(1));
+  it.line(100, 40, 103, 40, Color(1));
+  it.line(103, 40, 104, 47, Color(1));
+}
+
+void draw_lunch_crumbs(Display &it) {
+  it.filled_circle(94, 47, 1, Color(1));
+  it.draw_pixel_at(99, 51, Color(1));
+}
+
 void eye_wink_lid(Display &it, int cx, int cy) {
   for (int t = 0; t < 2; t++) {
     it.line(cx - 9, cy + 1 + t, cx + 9, cy - 1 + t, Color(1));
@@ -534,6 +571,30 @@ void mouth_dizzy(Display &it) {
     it.line(MX - 12, MY + t, MX - 4, MY + 4 + t, Color(1));
     it.line(MX - 4, MY + 4 + t, MX + 4, MY - 4 + t, Color(1));
     it.line(MX + 4, MY - 4 + t, MX + 12, MY + t, Color(1));
+  }
+}
+
+void mouth_bored(Display &it) {
+  it.line(MX - 10, MY + 2, MX + 4, MY + 2, Color(1));
+  it.line(MX + 4, MY + 2, MX + 10, MY - 1, Color(1));
+  it.line(MX - 10, MY + 3, MX + 4, MY + 3, Color(1));
+}
+
+void mouth_focus(Display &it) {
+  it.filled_rectangle(MX - 6, MY - 1, 13, 3, Color(1));
+}
+
+void mouth_lunch(Display &it) {
+  mouth_o(it, 7);
+  it.line(MX - 5, MY + 2, MX + 5, MY + 2, Color(1));
+  it.line(MX - 3, MY + 4, MX + 3, MY + 4, Color(1));
+}
+
+void mouth_chatter(Display &it, uint32_t now_ms) {
+  const int y = MY + (((now_ms / 400) % 2) ? 1 : -1);
+  it.rectangle(MX - 11, y - 3, 23, 7, Color(1));
+  for (int x = MX - 7; x <= MX + 7; x += 7) {
+    it.line(x, y - 2, x, y + 3, Color(1));
   }
 }
 
@@ -676,6 +737,62 @@ bool face_uses_living_gaze(int face) {
   }
 }
 
+int temperature_face_with_hysteresis(bool has_temp, float temp_c) {
+  if (!has_temp) {
+    s_temperature_face = STATE_NONE;
+    return STATE_NONE;
+  }
+
+  // Escalation uses the original thresholds. Recovery needs an extra 0.5°C,
+  // which prevents sensor noise from rapidly swapping adjacent expressions.
+  switch (s_temperature_face) {
+    case STATE_HOT_OVER:
+      if (temp_c > 29.5f) return STATE_HOT_OVER;
+      if (temp_c >= 27.5f) s_temperature_face = STATE_HOT_WARM;
+      else if (temp_c > 24.5f) s_temperature_face = STATE_HOT_MILD;
+      else s_temperature_face = STATE_NONE;
+      break;
+    case STATE_HOT_WARM:
+      if (temp_c > 30.0f) s_temperature_face = STATE_HOT_OVER;
+      else if (temp_c >= 27.5f) return STATE_HOT_WARM;
+      else s_temperature_face = (temp_c > 24.5f) ? STATE_HOT_MILD : STATE_NONE;
+      break;
+    case STATE_HOT_MILD:
+      if (temp_c > 30.0f) s_temperature_face = STATE_HOT_OVER;
+      else if (temp_c >= 28.0f) s_temperature_face = STATE_HOT_WARM;
+      else if (temp_c > 24.5f) return STATE_HOT_MILD;
+      else s_temperature_face = STATE_NONE;
+      break;
+    case STATE_COLD_FREEZE:
+      if (temp_c < 17.5f) return STATE_COLD_FREEZE;
+      if (temp_c <= 18.5f) s_temperature_face = STATE_COLD_SAD;
+      else if (temp_c < 19.5f) s_temperature_face = STATE_COLD_CHILLY;
+      else s_temperature_face = STATE_NONE;
+      break;
+    case STATE_COLD_SAD:
+      if (temp_c < 17.0f) s_temperature_face = STATE_COLD_FREEZE;
+      else if (temp_c <= 18.5f) return STATE_COLD_SAD;
+      else s_temperature_face = (temp_c < 19.5f) ? STATE_COLD_CHILLY : STATE_NONE;
+      break;
+    case STATE_COLD_CHILLY:
+      if (temp_c < 17.0f) s_temperature_face = STATE_COLD_FREEZE;
+      else if (temp_c <= 18.0f) s_temperature_face = STATE_COLD_SAD;
+      else if (temp_c < 19.5f) return STATE_COLD_CHILLY;
+      else s_temperature_face = STATE_NONE;
+      break;
+    default:
+      if (temp_c > 30.0f) s_temperature_face = STATE_HOT_OVER;
+      else if (temp_c >= 28.0f) s_temperature_face = STATE_HOT_WARM;
+      else if (temp_c > 25.0f) s_temperature_face = STATE_HOT_MILD;
+      else if (temp_c < 17.0f) s_temperature_face = STATE_COLD_FREEZE;
+      else if (temp_c <= 18.0f) s_temperature_face = STATE_COLD_SAD;
+      else if (temp_c < 19.0f) s_temperature_face = STATE_COLD_CHILLY;
+      else s_temperature_face = STATE_NONE;
+      break;
+  }
+  return s_temperature_face;
+}
+
 // Surprise: line → open O → hold 1s → close. Loops in gallery.
 void mouth_surprised_anim(Display &it, uint32_t now_ms) {
   constexpr uint32_t OPEN_MS = 400;
@@ -707,7 +824,12 @@ void mouth_surprised_anim(Display &it, uint32_t now_ms) {
 }
 
 void draw_base_mouth(Display &it, int face, uint32_t now_ms, bool mouth_talking) {
-  if (mouth_talking) {
+  const bool semantic_mouth =
+      face == STATE_SURPRISED || face == STATE_DIZZY || face == STATE_DIZZY_MAPLE ||
+      face == STATE_YAWNING_MAPLE || face == STATE_SLEEPY_MAPLE || face == STATE_SLEEP ||
+      face == STATE_HEART_EYES || face == STATE_HEART_EYES_ANIM || face == STATE_HEART_MAPLE ||
+      face == STATE_COLD_FREEZE || face == STATE_TRANSITION_BLINK;
+  if (mouth_talking && !semantic_mouth) {
     if ((now_ms / 280) % 2) {
       mouth_o(it, 6);
     } else {
@@ -741,8 +863,10 @@ void draw_base_mouth(Display &it, int face, uint32_t now_ms, bool mouth_talking)
       mouth_big(it, 14);
       break;
     case STATE_SMILE:
-    case STATE_LUNCH:
       mouth_smile(it, 18, 7);
+      break;
+    case STATE_LUNCH:
+      mouth_lunch(it);
       break;
     case STATE_SAD:
       mouth_frown(it, 12);
@@ -754,8 +878,10 @@ void draw_base_mouth(Display &it, int face, uint32_t now_ms, bool mouth_talking)
       mouth_frown(it, 11);
       break;
     case STATE_COLD_SAD:
-    case STATE_COLD_FREEZE:
       mouth_frown(it, 14);  // inverse-curve "cold grin"
+      break;
+    case STATE_COLD_FREEZE:
+      mouth_chatter(it, now_ms);
       break;
     case STATE_SLEEPY_MAPLE: {
       const SleepyPhase sp = sleepy_phase(now_ms);
@@ -783,15 +909,20 @@ void draw_base_mouth(Display &it, int face, uint32_t now_ms, bool mouth_talking)
     case STATE_HOT_MILD:
     case STATE_HOT_WARM:
     case STATE_HOT_OVER:
-    case STATE_FOCUS:
     case STATE_SLEEP:
-    case STATE_BORED:
-    case STATE_BORED_MAPLE:
     case STATE_WORKING:
     case STATE_WORKING_MAPLE:
     case STATE_IDLE:
+    case STATE_TRANSITION_BLINK:
     default:
       mouth_line(it, 9);
+      break;
+    case STATE_FOCUS:
+      mouth_focus(it);
+      break;
+    case STATE_BORED:
+    case STATE_BORED_MAPLE:
+      mouth_bored(it);
       break;
   }
 }
@@ -821,13 +952,21 @@ bool wink_right_closed(uint32_t now_ms) {
   return age >= PRE_MS && age < PRE_MS + WINK_CLOSED_MS;
 }
 
-void draw_base_eyes(Display &it, int face, uint32_t now_ms, bool blink, int gaze, bool /*dizzy_severe*/,
-                    uint32_t /*dizzy_started_ms*/) {
+void draw_base_eyes(Display &it, int face, uint32_t now_ms, bool blink, int gaze, bool dizzy_severe,
+                    uint32_t dizzy_started_ms) {
   const int hs_raw = (now_ms / 280) % 4;
   const int hs = (hs_raw == 3) ? 1 : hs_raw;
 
   switch (face) {
     case STATE_DIZZY:
+      if (dizzy_severe && (uint32_t) (now_ms - dizzy_started_ms) >= 1200) {
+        eye_x(it, EL, EY);
+        eye_x(it, ER, EY);
+      } else {
+        eye_spiral_rotating(it, EL, EY, now_ms);
+        eye_spiral_rotating(it, ER, EY, now_ms);
+      }
+      break;
     case STATE_DIZZY_MAPLE:
       eye_spiral_rotating(it, EL, EY, now_ms);
       eye_spiral_rotating(it, ER, EY, now_ms);
@@ -952,6 +1091,10 @@ void draw_base_eyes(Display &it, int face, uint32_t now_ms, bool blink, int gaze
       eye_x(it, EL, EY - 1, 7);
       eye_x(it, ER, EY - 1, 7);
       break;
+    case STATE_TRANSITION_BLINK:
+      eye_closed(it, EL, EY, EYE_R + 2);
+      eye_closed(it, ER, EY, EYE_R + 2);
+      break;
     case STATE_IDLE:
     default:
       eye_pair(it, face_uses_living_gaze(face) ? gaze : 0, BROW_IDLE, blink, OPEN_NORMAL, now_ms, 0, EYE_R, 3);
@@ -970,8 +1113,8 @@ int buddy_gallery_face(int index) {
   return GALLERY[index % GALLERY_N];
 }
 
-const char *buddy_gallery_label(int index) {
-  switch (buddy_gallery_face(index)) {
+const char *buddy_face_label(int face) {
+  switch (face) {
     case STATE_IDLE:
       return "IDLE";
     case STATE_SMILE:
@@ -979,18 +1122,23 @@ const char *buddy_gallery_label(int index) {
     case STATE_SMILE_ACTIVE:
       return "WINK";
     case STATE_HAPPY:
+    case STATE_HAPPY_ANIM:
       return "HAPPY";
     case STATE_HEART_EYES:
+    case STATE_HEART_EYES_ANIM:
       return "HEART";
     case STATE_SURPRISED:
       return "SURPRISE";
     case STATE_DIZZY:
+    case STATE_DIZZY_MAPLE:
       return "DIZZY";
     case STATE_WORKING:
+    case STATE_WORKING_MAPLE:
       return "WORK";
     case STATE_FOCUS:
       return "FOCUS";
     case STATE_BORED:
+    case STATE_BORED_MAPLE:
       return "BORED";
     case STATE_LUNCH:
       return "LUNCH";
@@ -1025,12 +1173,14 @@ const char *buddy_gallery_label(int index) {
   }
 }
 
+const char *buddy_gallery_label(int index) { return buddy_face_label(buddy_gallery_face(index)); }
+
 int buddy_select_face(int current_state, int happiness_level, int random_event_id, uint32_t random_event_end_ms,
                       uint32_t now_ms, int hour, bool has_temp, float temp_c) {
   if (current_state != STATE_IDLE) {
     return current_state;
   }
-  if (random_event_id != STATE_NONE && now_ms < random_event_end_ms) {
+  if (random_event_id != STATE_NONE && !buddy_time_reached(now_ms, random_event_end_ms)) {
     return STATE_EVENT_BASE + random_event_id;
   }
   if (happiness_level >= 3) {
@@ -1042,26 +1192,10 @@ int buddy_select_face(int current_state, int happiness_level, int random_event_i
   if (happiness_level == 1) {
     return STATE_SMILE;
   }
-  // Temperature comfort overrides time-of-day mood when the room is harsh
-  if (has_temp) {
-    if (temp_c > 30.0f) {
-      return STATE_HOT_OVER;
-    }
-    if (temp_c >= 28.0f) {
-      return STATE_HOT_WARM;
-    }
-    if (temp_c > 25.0f) {
-      return STATE_HOT_MILD;
-    }
-    if (temp_c < 17.0f) {
-      return STATE_COLD_FREEZE;
-    }
-    if (temp_c <= 18.0f) {
-      return STATE_COLD_SAD;
-    }
-    if (temp_c < 19.0f) {
-      return STATE_COLD_CHILLY;
-    }
+  // Temperature comfort overrides time-of-day mood when the room is harsh.
+  const int temperature_face = temperature_face_with_hysteresis(has_temp, temp_c);
+  if (temperature_face != STATE_NONE) {
+    return temperature_face;
   }
   if (hour >= 7 && hour < 9) {
     return STATE_SLEEPY_MAPLE;
@@ -1078,7 +1212,7 @@ int buddy_select_face(int current_state, int happiness_level, int random_event_i
   if (hour >= 18 && hour < 22) {
     return STATE_SAD;
   }
-  if (hour >= 22 || hour < 7) {
+  if (hour >= 0 && (hour >= 22 || hour < 7)) {
     return STATE_SLEEP;
   }
   return STATE_IDLE;
@@ -1088,18 +1222,18 @@ int buddy_present_face(int target_face, uint32_t now_ms) {
   const int target_fam = expression_family(target_face);
 
   if (s_in_transition) {
-    if (now_ms >= s_transition_until) {
+    if (buddy_time_reached(now_ms, s_transition_until)) {
       s_in_transition = false;
       s_current_family = target_fam;
       return target_face;
     }
-    return STATE_IDLE;
+    return STATE_TRANSITION_BLINK;
   }
 
   if (target_fam != s_current_family) {
     s_in_transition = true;
     s_transition_until = now_ms + TRANSITION_MS;
-    return STATE_IDLE;
+    return STATE_TRANSITION_BLINK;
   }
 
   return target_face;
@@ -1126,6 +1260,10 @@ void buddy_draw_face(Display &it, int face, uint32_t now_ms, bool mouth_talking,
 
   draw_base_eyes(it, face, now_ms, blink, s_gaze, dizzy_severe, dizzy_started_ms);
 
+  if (face == STATE_COLD_CHILLY || face == STATE_COLD_SAD || face == STATE_COLD_FREEZE) {
+    draw_cold_marks(it, face, now_ms);
+  }
+
   if (face == STATE_HEART_EYES || face == STATE_HEART_EYES_ANIM || face == STATE_HEART_MAPLE || face == STATE_HAPPY ||
       face == STATE_HAPPY_ANIM || face == STATE_THUMBUP_MAPPLE || face == STATE_SMILE_ACTIVE || face == STATE_SMILE ||
       face == STATE_LUNCH) {
@@ -1139,4 +1277,10 @@ void buddy_draw_face(Display &it, int face, uint32_t now_ms, bool mouth_talking,
   }
 
   draw_base_mouth(it, face, now_ms, mouth_talking);
+
+  if (face == STATE_LUNCH) {
+    draw_lunch_crumbs(it);
+  } else if (face == STATE_THUMBUP_MAPPLE) {
+    draw_thumb_up(it);
+  }
 }
